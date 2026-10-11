@@ -268,6 +268,104 @@ void main() {
 '   float shell = 0.62 - abs(s);\n' +
 '   float bound = 0.95 - length(p);\n' +
 '   return min(shell, bound);\n' +
+'}\n' },
+  // ---- 以下 6 个：比原版分形便宜，但形状比球/立方体复杂得多 ----
+  { name: '曼德尔球·简', std: false, glsl:
+'float kernal(vec3 ver){\n' +
+'   vec3 a;\n' +
+'   float b,c,d;\n' +
+'   a=ver;\n' +
+'   for(int i=0;i<3;i++){\n' +
+'       b=length(a);\n' +
+'       c=atan(a.y,a.x)*4.0;\n' +
+'       d=acos(a.z/b)*4.0;\n' +
+'       b=pow(b,4.0);\n' +
+'       a=vec3(b*sin(d)*cos(c),b*sin(d)*sin(c),b*cos(d))+ver;\n' +
+'       if(b>6.0){ break; }\n' +
+'   }\n' +
+'   return 4.0-a.x*a.x-a.y*a.y-a.z*a.z;\n' +
+'}\n' },
+  { name: '门格海绵', std: false, glsl:
+'float kernal(vec3 p){\n' +
+'   vec3 q = abs(p) - vec3(0.85);\n' +
+'   float d = length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);\n' +
+'   float s = 1.0;\n' +
+'   for(int i=0;i<3;i++){\n' +
+'       vec3 a = mod(p*s, 2.0) - 1.0;\n' +
+'       s *= 3.0;\n' +
+'       vec3 r = abs(1.0 - 3.0*abs(a));\n' +
+'       float da = max(r.x,r.y);\n' +
+'       float db = max(r.y,r.z);\n' +
+'       float dc = max(r.z,r.x);\n' +
+'       float c = (min(da,min(db,dc)) - 1.0)/s;\n' +
+'       d = max(d,c);\n' +
+'   }\n' +
+'   return -d;\n' +
+'}\n' },
+  { name: '钻石曲面', std: false, glsl:
+'float kernal(vec3 p){\n' +
+'   vec3 q = p * 3.4;\n' +
+'   float s = sin(q.x)*sin(q.y)*sin(q.z)\n' +
+'           + sin(q.x)*cos(q.y)*cos(q.z)\n' +
+'           + cos(q.x)*sin(q.y)*cos(q.z)\n' +
+'           + cos(q.x)*cos(q.y)*sin(q.z);\n' +
+'   float shell = 0.35 - abs(s);\n' +
+'   float bound = 0.95 - length(p);\n' +
+'   return min(shell, bound);\n' +
+'}\n' },
+  { name: '环面纽结', std: false, glsl:
+'float kernal(vec3 p){\n' +
+'   float a = atan(p.z, p.x);\n' +
+'   float rr = 0.60 + 0.14*cos(2.0*a);\n' +
+'   float yy = 0.26*sin(3.0*a);\n' +
+'   vec2 q = vec2(length(p.xz) - rr, p.y - yy);\n' +
+'   return -(length(q) - 0.15);\n' +
+'}\n' },
+  { name: '尖刺球', std: false, glsl:
+'float kernal(vec3 p){\n' +
+'   float r = length(p);\n' +
+'   if(r < 1e-4){ return 0.8; }\n' +
+'   float th = acos(p.z/r);\n' +
+'   float ph = atan(p.y,p.x);\n' +
+'   float spike = 0.10*sin(7.0*ph)*sin(5.0*th) + 0.05*sin(11.0*th);\n' +
+'   return -(r - (0.72 + spike));\n' +
+'}\n' },
+  { name: '镂空立方', std: false, glsl:
+'float kernal(vec3 p){\n' +
+'   vec3 q = abs(p) - vec3(0.72);\n' +
+'   float box = length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);\n' +
+'   float ax = length(p.yz) - 0.44;\n' +
+'   float ay = length(p.xz) - 0.44;\n' +
+'   float az = length(p.xy) - 0.44;\n' +
+'   float holes = min(min(ax,ay),az);\n' +
+'   return -max(box, -holes);\n' +
+'}\n' },
+  // ---- 玫瑰：上下两面互为镜像 ----
+  { name: '玫瑰线', std: false, glsl:
+'float kernal(vec3 p){\n' +
+'   float r = length(p.xz);\n' +
+'   float th = atan(p.z, p.x);\n' +
+'   // |cos(2.5*th)| 在 th=0..2PI 上首尾连续，给出 5 片花瓣\n' +
+'   float rose = 0.66 * abs(cos(2.5 * th));\n' +
+'   float u = r / max(rose, 1e-2);\n' +
+'   // 厚度不乘轮廓系数：否则边缘厚度被压到 0，斜俯视下看成一条扁带\n' +
+'   float halfh = 0.20 + 0.10 * u * u;\n' +
+'   float d = abs(p.y) - halfh;\n' +
+'   // 用 max 取交集：既要落在花瓣轮廓内(u<1)，又要在厚度范围内\n' +
+'   float radial = (u - 1.0) * rose;\n' +
+'   // abs(p.y) 保证上下两面严格镜像\n' +
+'   return -max(d, radial);\n' +
+'}\n' },
+  { name: '球形玫瑰', std: false, glsl:
+'float kernal(vec3 p){\n' +
+'   float r = length(p);\n' +
+'   if(r < 1e-4){ return 0.60; }\n' +
+'   float th = acos(p.z / r);\n' +
+'   float ph = atan(p.y, p.x);\n' +
+'   // cos(2n*th) 在 th 与 PI-th 处取值相同 -> 南北严格镜像\n' +
+'   float w = 0.13 * cos(2.0 * th) + 0.07 * cos(4.0 * th);\n' +
+'   float rose = 0.60 + 0.14 * cos(5.0 * ph) + w;\n' +
+'   return -(r - rose);\n' +
 '}\n' }
   ];
 
