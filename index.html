@@ -10,15 +10,12 @@
   #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
   /* 正方形渲染缓冲 + contain：竖屏不会多算 1.5 倍像素（那正是卡死主因之一） */
   canvas{width:100%;height:100%;object-fit:contain;background:#fbf7fe;touch-action:none;}
-  /* 固定宽度：曲线画布尺寸才稳定，不会因文字长短被拉伸变模糊 */
-  #hud{position:fixed;left:8px;top:8px;width:min(224px,64vw);background:#000000cc;
-    color:#FFD54F;padding:6px 8px;font-size:11px;line-height:1.45;border-radius:6px;
+  /* 不设 right：宽度随内容收缩，尽量少遮模型 */
+  #hud{position:fixed;left:8px;top:8px;max-width:62vw;background:#000000cc;color:#FFD54F;
+    padding:6px 8px;font-size:11px;line-height:1.45;border-radius:6px;
     white-space:pre-wrap;word-break:break-all;pointer-events:none;z-index:9;}
   #hud .warn{color:#FF8A80;}
   #hud .ok{color:#B9F6CA;}
-  #hud .dim{color:#9E9E9E;}
-  #spark{display:block;margin-top:4px;border-radius:3px;background:#00000066;
-    width:100%;height:30px;}
   #bar{position:fixed;left:0;right:0;bottom:0;display:flex;gap:4px;padding:6px;
     background:#000000bb;z-index:9;}
   button{flex:1;background:#333;color:#eee;border:0;border-radius:5px;
@@ -30,7 +27,7 @@
 </head>
 <body>
 <div id="wrap"><canvas id="cv"></canvas></div>
-<div id="hud"><div id="hudText">初始化…</div><canvas id="spark" width="240" height="30"></canvas></div>
+<div id="hud">初始化…</div>
 <div id="bar">
   <button id="bLvl">档位</button>
   <button id="bSize">尺寸</button>
@@ -199,7 +196,7 @@ void main() {
   // 除 FRACTAL 外都是解析 SDF，求值成本极低，手机可满帧旋转。
   // 只有 FRACTAL 才是标准 vsbm 负载，其余仅供流畅交互/形状对比。
   var MODELS = [
-    { name: '分形', std: true, glsl:
+    { name: '分形(标准)', std: true, glsl:
 'float kernal(vec3 ver){\n' +
 '   vec3 a;\n' +
 '   float b,c,d;\n' +
@@ -279,7 +276,6 @@ void main() {
   var running = false, lost = false;
 
   var hud = document.getElementById('hud');
-  var hudText = document.getElementById('hudText');   // 只改这里，避免清除 spark/load 子节点
   var wrap = document.getElementById('wrap');
   var cv = document.getElementById('cv');
   var gl = null, prog = 0, U = {}, ang = 1.2, ang2 = 0.4, lenV = 1.6;
@@ -287,216 +283,6 @@ void main() {
 
   var VS = document.getElementById('vsSrc').textContent;
   var FS_RAW = document.getElementById('fsSrc').textContent;
-
-  // ================= 帧率曲线 =================
-  // 只记录"实际跑出来的帧率"，不推算 GPU 占用率——
-  // 浏览器拿不到真实 GPU 时间（移动端基本没有计时扩展），推算出来的百分比不可信，
-  // 与其给个假数字，不如只呈现能测准的：每秒实际画了几帧。
-  var Fps = {
-    hist: [],            // 每帧瞬时 fps（1000/帧间隔）
-    HIST_MAX: 150,       // 约 2.5 秒 @60fps
-    last: 0,
-    cur: 0, min: 0, max: 0, avg: 0,
-    vsyncMs: 0,          // 屏幕刷新周期（用于画"满帧"参考线）
-    _sm: [],             // 中值滤波结果缓存
-
-    reset: function () {
-      this.hist.length = 0;
-      this._sm.length = 0;
-      this.last = 0; this.cur = 0;
-      this.min = 0; this.max = 0; this.avg = 0;
-    },
-
-    // 每帧调用一次，传入当前时间戳
-    tick: function (now) {
-      if (this.last) {
-        var gap = now - this.last;
-        var vsync = this.vsyncMs || 16.7;
-
-        // 判据一：短于刷新周期 75% 的间隔在物理上不可能（rAF 由 vsync 驱动），
-        // 必是快速缩放时被塞进来的额外回调。
-        // 关键：这里 return 之前不更新 last，间隔会自动累计到下一帧 —— 时间不丢、样本不多。
-        // 上限 12ms：即使 vsyncMs 测量失真偏大，也不至于误拒大量正常帧
-        var minGap = Math.min(12, Math.max(4, vsync * 0.75));
-        if (gap < minGap) return;   // 不更新 last，间隔累计到下一帧
-
-        // 判据二：算出比刷新率还高 25% 的帧率同样是异常，直接丢弃该样本。
-        // 注意这里是「丢弃」而不是「钳到上限」——
-        // 上一版用钳制，结果把垃圾值改头换面成 179fps 存进曲线，
-        // 数字看着合理，其实是假的。宁可少一个样本，也不要一个假样本。
-        var f = 1000 / gap;
-        var dropFps = (1000 / vsync) * 1.25;
-        // 绝对物理上限兜底：手机刷新率再高也不超过 165Hz，
-        // 若 vsyncMs 因测量受干扰而偏小，这条能保证阈值不会跟着失控。
-        if (dropFps > 210) dropFps = 210;
-        if (f > dropFps) return;
-
-        if (gap < 10000) {                 // 上限：排除切后台再回来的巨间隔
-          this.cur = f;
-          this.hist.push(f);
-          if (this.hist.length > this.HIST_MAX) this.hist.shift();
-        }
-      }
-      this.last = now;
-      this.stats();
-    },
-
-    // 三点中值滤波：干掉孤立尖峰，但保留真实的持续变化
-    // （单个 250fps 夹在两个 86 中间会被抹平；连续多个 40 不会被抹）
-    smoothed: function () {
-      var h = this.hist, n = h.length, out = this._sm;
-      out.length = n;
-      if (n < 3) { for (var j = 0; j < n; j++) out[j] = h[j]; return out; }
-      out[0] = h[0];
-      out[n - 1] = h[n - 1];
-      for (var i = 1; i < n - 1; i++) {
-        var a = h[i - 1], b = h[i], c = h[i + 1];
-        out[i] = (a <= b ? (b <= c ? b : (a <= c ? c : a))
-                         : (a <= c ? a : (b <= c ? c : b)));
-      }
-      return out;
-    },
-
-    stats: function () {
-      var s = this.smoothed(), n = s.length;
-      if (!n) { this.min = this.max = this.avg = 0; return; }
-      var mn = Infinity, mx = 0, sum = 0;
-      for (var i = 0; i < n; i++) {
-        if (s[i] < mn) mn = s[i];
-        if (s[i] > mx) mx = s[i];
-        sum += s[i];
-      }
-      this.min = mn; this.max = mx; this.avg = sum / n;
-    },
-
-    // 近 0.5 秒的平均：用于 HUD 上的数字。
-    // 必须和曲线取自同一份"清洗过"的数据，否则快速缩放时
-    // 数字会把被剔除的碎片回调也算进去，出现"曲线 86、数字 98"的矛盾。
-    avgLast: function () {
-      var s = this.smoothed(), n = s.length;
-      if (!n) return 0;
-      var vsync = this.vsyncMs || 16.7;
-      var k = Math.min(30, Math.max(4, Math.round(500 / vsync)));
-      if (k > n) k = n;
-      var sum = 0;
-      for (var i = n - k; i < n; i++) sum += s[i];
-      return sum / k;
-    }
-  };
-
-  // --- 测屏幕刷新周期 ---
-  // 用 32² 极轻缓冲跑若干帧（像素数只有 512² 的 1/256），负载可忽略，
-  // 测到的帧间隔≈刷新周期。只为画"满帧"参考线，不用于推算 GPU 占用。
-  //
-  // 这个值一旦测不准，后面的尖峰过滤阈值会跟着全错：
-  // 测小了 → 放行阈值抬高，179fps 这类假值就冒出来；
-  // 测大了 → 正常帧被误判成碎片，帧率被系统性算低。
-  // 所以这里宁可多跑几帧，也要取到稳的值。
-  function measureRefresh(done) {
-    var samples = [], n = 0, last = 0;
-    var savedBuf = SIZES[si];
-    setBuf(32);
-    function step() {
-      var now = performance.now();
-      if (last && n > 2) samples.push(now - last);   // 丢前 2 帧（含编译/上传抖动）
-      last = now;
-      draw();
-      if (++n < 32) { requestAnimationFrame(step); return; }
-      setBuf(savedBuf);
-      if (samples.length) {
-        // 剔除毛刺：切帧/首次绘制都可能产生极小或极大间隔
-        var clean = samples.filter(function (v) { return v >= 2 && v <= 60; });
-        if (!clean.length) clean = samples;
-        clean.sort(function (a, b) { return a - b; });
-        // 中位数。不要用 25 分位（取偏快的一档）——
-        // 那会让几个偏快采样把结果拉低，179fps 正是这么来的。
-        var med = clean[clean.length >> 1];
-        // 合理范围：6.5ms(154Hz) ~ 40ms(25Hz)
-        Fps.vsyncMs = Math.min(40, Math.max(6.5, med));
-      } else {
-        Fps.vsyncMs = 16.7;
-      }
-      if (done) done();
-    }
-    requestAnimationFrame(step);
-  }
-
-  // --- 帧率曲线（2D canvas，独立于 WebGL 主画布）---
-  var spark = document.getElementById('spark');
-  var sctx = spark.getContext('2d');
-  var sparkW = 0, sparkH = 30, sparkDpr = 0;
-
-  // 按设备像素比设置后备缓冲，否则手机上（dpr 2~3）位图被拉伸，线条必然发虚。
-  // 只在 CSS 尺寸或 dpr 变化时重设——重设 canvas.width 会清空上下文，不能每帧做。
-  function setupSpark() {
-    var cssW = spark.clientWidth || 208;
-    var dpr = Math.min(window.devicePixelRatio || 1, 3);
-    if (cssW === sparkW && dpr === sparkDpr) return;
-    sparkW = cssW; sparkDpr = dpr;
-    spark.width = Math.round(cssW * dpr);
-    spark.height = Math.round(sparkH * dpr);
-    spark.style.width = cssW + 'px';
-    spark.style.height = sparkH + 'px';
-    sctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // 之后一律用 CSS 像素坐标
-  }
-
-  function drawSpark() {
-    setupSpark();
-    var w = sparkW, h = sparkH;
-    if (!w) return;
-    sctx.clearRect(0, 0, w, h);
-
-    var hist = Fps.smoothed();
-    var n = hist.length;
-    if (n < 2) return;
-
-    var mx = 0;
-    for (var i = 0; i < n; i++) if (hist[i] > mx) mx = hist[i];
-    if (mx <= 0) return;
-
-    // 满帧参考线：屏幕刷新率（未测到时按 60 兜底）
-    var refFps = Fps.vsyncMs > 0 ? 1000 / Fps.vsyncMs : 60;
-    // 纵轴上限取「实测最高」与「满帧」的较大者，保证参考线一定可见
-    var cap = Math.max(mx * 1.15, refFps * 1.1);
-    var yv = function (f) { return h - Math.min(1, f / cap) * h; };
-
-    sctx.fillStyle = '#00000055';
-    sctx.fillRect(0, 0, w, h);
-
-    var yRef = yv(refFps);
-    if (yRef > 0 && yRef < h) {
-      sctx.strokeStyle = '#4CAF50';
-      sctx.setLineDash([3, 3]);
-      // +0.5 对齐到半像素，虚线才不会糊成一片
-      sctx.beginPath(); sctx.moveTo(0, Math.round(yRef) + 0.5);
-      sctx.lineTo(w, Math.round(yRef) + 0.5); sctx.stroke();
-      sctx.setLineDash([]);
-    }
-
-    // 曲线：越往上帧率越高
-    sctx.beginPath();
-    var span = Math.max(Fps.HIST_MAX - 1, n - 1);
-    for (var k = 0; k < n; k++) {
-      var x = (k / span) * w;
-      var y = yv(hist[k]);
-      if (k === 0) sctx.moveTo(x, y); else sctx.lineTo(x, y);
-    }
-    sctx.strokeStyle = '#FFD54F';
-    sctx.lineWidth = 1.25;
-    sctx.lineJoin = 'round';
-    sctx.stroke();
-
-    sctx.lineTo(((n - 1) / span) * w, h);
-    sctx.lineTo(0, h);
-    sctx.closePath();
-    sctx.fillStyle = '#FFD54F22';
-    sctx.fill();
-
-    // 标注：满帧值
-    sctx.fillStyle = '#4CAF50';
-    sctx.font = '9px monospace';
-    sctx.fillText(refFps.toFixed(0) + 'fps', 2, Math.max(9, yRef - 2));
-  }
 
   function defines(l, m) {
     return '#define PI 3.14159265358979324\n' +
@@ -559,7 +345,7 @@ void main() {
     // GPU 上下文丢失：负载过高时驱动会直接回收，必须捕获，否则就是永久白屏
     cv.addEventListener('webglcontextlost', function (e) {
       e.preventDefault(); lost = true; stop();
-      note = 'GPU 上下文丢失，已停止 · 请降档位或尺寸';
+      note = 'GPU 上下文丢失，已停止 · 降档位或尺寸';
       paint();
     });
     cv.addEventListener('webglcontextrestored', function () { lost = false; });
@@ -670,18 +456,8 @@ void main() {
     frames++;
     ang += 0.01;
 
-    // 每帧记录瞬时帧率，供曲线绘制（曲线每帧都画才够跟手）
-    Fps.tick(now0);
-
     var now = performance.now(), el = now - t0;
-    if (el >= 500) {
-      // 数字取自清洗后的采样，不用 frames/elapsed —— 后者会把被剔除的
-      // 碎片回调也算成有效帧，快速缩放时会虚高到 136 这类不可能的值。
-      fps = Fps.avgLast();
-      frames = 0; t0 = now;
-      paint();
-    }
-    drawSpark();
+    if (el >= 500) { fps = frames * 1000 / el; frames = 0; t0 = now; paint(); }
     requestAnimationFrame(loop);
   }
   function emergency(gap) {
@@ -694,7 +470,6 @@ void main() {
     if (!gl || lost) return;
     setBuf(SIZES[si]);
     running = true; frames = 0; slowFrames = 0; lastTick = 0;
-    Fps.reset();                     // 换参数/重启都清空，避免旧数据混进新曲线
     t0 = performance.now();
     document.getElementById('bRun').textContent = '停止';
     document.getElementById('bRun').className = 'hot';
@@ -710,7 +485,7 @@ void main() {
   function autoDowngrade() {
     if (li > 0) li--;
     else if (si > 0) si--;
-    note += '\n已降级到 ' + LEVELS[li].name + ' / ' + SIZES[si] + '²';
+    note += '\n已降级 ' + LEVELS[li].name + ' / ' + SIZES[si] + '²';
   }
 
   // ---------- 切模型/档位/尺寸：先探测，不安全就问 ----------
@@ -718,7 +493,7 @@ void main() {
     stop();
     note = '';
     var mdl = MODELS[newMi], lvl = LEVELS[newLi], size = SIZES[newSi];
-    hudText.innerHTML = '<span class="ok">探测中 ' + mdl.name + '/' + lvl.name + '…</span>';
+    hud.innerHTML = '<span class="ok">探测中 ' + mdl.name + '/' + lvl.name + '…</span>';
     // 让 HUD 先绘制出来，再进重负载
     requestAnimationFrame(function () {
       requestAnimationFrame(function () {
@@ -729,7 +504,7 @@ void main() {
           e = probe(newLi, newSi, newMi);
         } catch (err) {
           setBuf(SIZES[si]);
-          note = '探测出错，已恢复：\n' + String(err && err.message || err);
+          note = '探测出错，已恢复';
           paint();
           return;
         }
@@ -746,7 +521,7 @@ void main() {
             '预计单帧 ' + e.toFixed(0) + ' ms（约 ' + f + ' FPS）。\n' +
             '这个负载很可能让手机卡死或触发 GPU 重置。\n\n确定要继续吗？'
           );
-          if (!go) { note = '已取消。建议：降档位或降尺寸。'; paint(); return; }
+          if (!go) { note = '已取消'; paint(); return; }
         }
         start();
         paint();
@@ -772,19 +547,13 @@ void main() {
   // 实测：只渲染 1 帧 + gl.finish()，拿到精确 GPU 耗时。只跑一帧，不会卡死。
   document.getElementById('bProbe').onclick = function () {
     stop();
-    hudText.innerHTML = '<span class="ok">实测中（只跑 1 帧）…</span>';
+    hud.innerHTML = '<span class="ok">实测中…</span>';
     requestAnimationFrame(function () {
       requestAnimationFrame(function () {
         setBuf(SIZES[si]);
         draw(); gl.finish();
         measured = perf(function () { draw(); gl.finish(); });
-        // 实测是同步 glFinish 的精确值，比监测推算更准，临时显示即可
-        note = '实测 ' + measured.toFixed(1) + 'ms（' +
-               (1000 / measured).toFixed(0) + ' fps）';
         paint();
-        setTimeout(function () {
-          if (note.indexOf('实测 ') === 0) { note = ''; paint(); }
-        }, 4000);
       });
     });
   };
@@ -852,43 +621,34 @@ void main() {
 
   function paint() {
     var l = LEVELS[li];
-    // 第一行：当前帧率 + 区间（min–max），稳定性一眼看出来
-    var h = '<b>' + fps.toFixed(0) + '</b> fps';
-    // 只在波动明显时才标区间，稳定时省掉这串数字
-    if (Fps.hist.length > 2 && (Fps.max - Fps.min) > Math.max(2, Fps.avg * 0.08)) {
-      h += ' <span class="dim">' + Fps.min.toFixed(0) + '–' +
-           Fps.max.toFixed(0) + '</span>';
-    }
-    // 第二行：档位 / 模型 / 尺寸
-    h += '\n' + l.name + ' · ' + MODELS[mi].name +
-         (MODELS[mi].std ? '' : '<span class="warn">*</span>') +
-         ' · ' + SIZES[si] + '²';
-    if (!running) h += '\n<span class="warn">○ 已停止</span>';
+    // 第一行：帧率 + 耗时（预估/实测）
+    var h = 'FPS ' + fps.toFixed(1) +
+            (est ? '  ' + est.toFixed(0) + 'ms' : '') +
+            (measured ? '  ' + measured.toFixed(1) + 'ms' : '') + '\n' +
+            // 第二行：档位 / 模型 / 尺寸
+            l.name + ' · ' + MODELS[mi].name +
+            (MODELS[mi].std ? '' : '<span class="warn">*</span>') +
+            ' · ' + SIZES[si] + '²';
     if (note) h += '\n<span class="warn">' + esc(note) + '</span>';
-    hudText.innerHTML = h;
+    hud.innerHTML = h;
   }
-
   function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
   // ---------- 启动：只初始化 + 画一帧，绝不直接开跑 ----------
   if (!init()) {
-    hudText.innerHTML = '<span class="warn">' + esc(note || '初始化失败') + '</span>';
+    hud.innerHTML = '<span class="warn">' + esc(note || '初始化失败') + '</span>';
   } else {
     // 先静态画一帧，确认有画面；跑循环要用户点【开始】
     setBuf(SIZES[si]);
     draw(); gl.finish();
     stop();                       // 同步按钮文案为「开始」
-    note = '点【开始】运行 · 【模型】可切简单形状';
-    // 提示几秒后自动消失，不再常驻占版面
-    setTimeout(function () { if (note.indexOf('点【开始】') === 0) { note = ''; paint(); } }, 5000);
-
-    // 拿到初始档位的耗时估算（用于切档位时的安全确认）
-    var e0 = probe(li, SIZES[si], mi);
-    if (e0 > 0) est = e0;
-    // 测屏幕刷新率（异步，约 0.3 秒），用于在帧率曲线上画"满帧"参考线
-    measureRefresh(function () { drawSpark(); paint(); });
+    note = '点【开始】运行';
+    // 几秒后自动消失，不再长期占版面
+    setTimeout(function () {
+      if (note.indexOf('点【开始】') === 0) { note = ''; paint(); }
+    }, 4000);
     paint();
   }
 })();
