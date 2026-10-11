@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>毒蘑菇 · 安全版</title>
+<style>
+  html,body{margin:0;height:100%;background:#131115;overflow:hidden;
+    font-family:monospace;-webkit-user-select:none;user-select:none;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  /* 正方形渲染缓冲 + contain：竖屏不会多算 1.5 倍像素（那正是卡死主因之一） */
+  canvas{width:100%;height:100%;object-fit:contain;background:#fbf7fe;touch-action:none;}
+  #hud{position:fixed;left:8px;top:8px;right:8px;background:#000000d9;color:#FFD54F;
+    padding:8px 10px;font-size:12px;line-height:1.6;border-radius:6px;
+    white-space:pre-wrap;word-break:break-all;pointer-events:none;z-index:9;}
+  #hud .warn{color:#FF8A80;}
+  #hud .ok{color:#B9F6CA;}
+  #bar{position:fixed;left:0;right:0;bottom:0;display:flex;gap:4px;padding:6px;
+    background:#000000bb;z-index:9;}
+  button{flex:1;background:#333;color:#eee;border:0;border-radius:5px;
+    padding:10px 2px;font-size:11px;font-family:monospace;}
+  button:active{background:#555;}
+  button.hot{background:#c62828;color:#fff;}
+  button.safe{background:#2e7d32;color:#fff;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="hud">初始化…</div>
+<div id="bar">
+  <button id="bLvl">档位</button>
+  <button id="bSize">尺寸</button>
+  <button id="bRun" class="safe">开始</button>
+  <button id="bProbe">实测</button>
+  <button id="bReset">复位</button>
+</div>
+
+<!-- ============ 顶点着色器（GLSL ES 1.00，兼容性最好） ============ -->
+<script id="vsSrc" type="x-shader/x-vertex">
+precision highp float;
+attribute vec4 position;
+varying vec3 dir, localdir;
+uniform vec3 right, forward, up, origin;
+uniform float x, y;
+void main() {
+   gl_Position = position;
+   dir = forward + right * position.x * x + up * position.y * y;
+   localdir.x = position.x * x;
+   localdir.y = position.y * y;
+   localdir.z = -1.0;
+}
+</script>
+
+<!-- ============ 片元着色器：cznull 原版数学，逐字移植 ============ -->
+<script id="fsSrc" type="x-shader/x-fragment">
+__PRECISION__
+__LEVEL_DEFINES__
+float kernal(vec3 ver){
+   vec3 a;
+   float b,c,d;
+   a=ver;
+   for(int i=0;i<5;i++){
+       b=length(a);
+       c=atan(a.y,a.x)*8.0;
+       d=acos(a.z/b)*8.0;
+       b=pow(b,8.0);
+       a=vec3(b*sin(d)*cos(c),b*sin(d)*sin(c),b*cos(d))+ver;
+       if(b>6.0){ break; }
+   }
+   return 4.0-a.x*a.x-a.y*a.y-a.z*a.z;
+}
+uniform vec3 right, forward, up, origin;
+uniform float len;
+varying vec3 dir, localdir;
+vec3 ver;
+int hit;
+float v, v1, v2;
+float r1, r2, r3, r4, m1, m2, m3, m4;
+vec3 n, refl;
+const float step_ = STEP;
+vec3 color;
+void main() {
+   color.r=0.0; color.g=0.0; color.b=0.0;
+   hit=0;
+   v1 = kernal(origin + dir * (step_*len));
+   v2 = kernal(origin);
+   for (int k = 2; k < STEPS; k++) {
+      ver = origin + dir * (step_*len*float(k));
+      v = kernal(ver);
+      if (v > 0.0 && v1 < 0.0) {
+         r1 = step_ * len*float(k - 1);
+         r2 = step_ * len*float(k);
+         m1 = kernal(origin + dir * r1);
+         m2 = kernal(origin + dir * r2);
+         for (int l = 0; l < SOLVER; l++) {
+            r3 = r1 * 0.5 + r2 * 0.5;
+            m3 = kernal(origin + dir * r3);
+            if (m3 > 0.0) { r2 = r3; m2 = m3; }
+            else          { r1 = r3; m1 = m3; }
+         }
+         if (r3 < 2.0 * len) { hit=1; break; }
+      }
+      if (v < v1 && v1>v2 && v1 < 0.0 && (v1*2.0 > v || v1 * 2.0 > v2)) {
+         r1 = step_ * len*float(k - 2);
+         r2 = step_ * len*(float(k) - 2.0 + 2.0*M_L);
+         r3 = step_ * len*(float(k) - 2.0 + 2.0*M_R);
+         r4 = step_ * len*float(k);
+         m2 = kernal(origin + dir * r2);
+         m3 = kernal(origin + dir * r3);
+         for (int l = 0; l < MAXR; l++) {
+            if (m2 > m3) {
+               r4 = r3; r3 = r2;
+               r2 = r4 * M_L + r1 * M_R;
+               m3 = m2;
+               m2 = kernal(origin + dir * r2);
+            } else {
+               r1 = r2; r2 = r3;
+               r3 = r4 * M_R + r1 * M_L;
+               m2 = m3;
+               m3 = kernal(origin + dir * r3);
+            }
+         }
+         if (m2 > 0.0) {
+            r1 = step_ * len*float(k - 2);
+            m1 = kernal(origin + dir * r1);
+            m2 = kernal(origin + dir * r2);
+            for (int l = 0; l < SOLVER; l++) {
+               r3 = r1 * 0.5 + r2 * 0.5;
+               m3 = kernal(origin + dir * r3);
+               if (m3 > 0.0) { r2 = r3; m2 = m3; }
+               else          { r1 = r3; m1 = m3; }
+            }
+            if (r3 < 2.0 * len && r3 > step_*len) { hit=1; break; }
+         } else if (m3 > 0.0) {
+            r1 = step_ * len*float(k - 2);
+            r2 = r3;
+            m1 = kernal(origin + dir * r1);
+            m2 = kernal(origin + dir * r2);
+            for (int l = 0; l < SOLVER; l++) {
+               r3 = r1 * 0.5 + r2 * 0.5;
+               m3 = kernal(origin + dir * r3);
+               if (m3 > 0.0) { r2 = r3; m2 = m3; }
+               else          { r1 = r3; m1 = m3; }
+            }
+            if (r3 < 2.0 * len && r3 > step_*len) { hit=1; break; }
+         }
+      }
+      v2 = v1;
+      v1 = v;
+   }
+   if (hit==1) {
+      ver = origin + dir*r3;
+      r1 = ver.x*ver.x+ver.y*ver.y+ver.z*ver.z;
+      n.x = kernal(ver - right   * (r3*0.00025)) - kernal(ver + right   * (r3*0.00025));
+      n.y = kernal(ver - up      * (r3*0.00025)) - kernal(ver + up      * (r3*0.00025));
+      n.z = kernal(ver + forward * (r3*0.00025)) - kernal(ver - forward * (r3*0.00025));
+      r3 = n.x*n.x+n.y*n.y+n.z*n.z;
+      n = n * (1.0 / sqrt(r3));
+      ver = localdir;
+      r3 = ver.x*ver.x+ver.y*ver.y+ver.z*ver.z;
+      ver = ver * (1.0 / sqrt(r3));
+      refl = n * (-2.0*dot(ver, n)) + ver;
+      r3 = refl.x*0.276+refl.y*0.920+refl.z*0.276;
+      r4 = n.x*0.276+n.y*0.920+n.z*0.276;
+      r3 = max(0.0,r3);
+      r3 = r3 * r3*r3*r3;
+      r3 = r3 * 0.45 + r4 * 0.25 + 0.3;
+      n.x = sin(r1*10.0)*0.5+0.5;
+      n.y = sin(r1*10.0+2.05)*0.5+0.5;
+      n.z = sin(r1*10.0-2.05)*0.5+0.5;
+      color = n*r3;
+   }
+   gl_FragColor = vec4(color.x, color.y, color.z, 1.0);
+}
+</script>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---- 档位：SIMPLE 起步，绝不默认给重负载 ----
+  var LEVELS = [
+    { name: 'SIMPLE',   step: '0.01',  steps: 202,  maxr: 4, solver: 4 },
+    { name: 'STANDARD', step: '0.004', steps: 502,  maxr: 6, solver: 6 },
+    { name: 'ADVANCED', step: '0.002', steps: 1002, maxr: 8, solver: 8 },
+    { name: 'EXTREME',  step: '0.001', steps: 2002, maxr: 8, solver: 8 }
+  ];
+  // 正方形缓冲边长（原版网页就是 1024×1024 正方形）
+  var SIZES = [256, 384, 512, 768, 1024];
+
+  var li = 0, si = 2;              // 默认 SIMPLE + 512²，安全起步
+  var fps = 0, gpu = '-', note = '', est = 0, measured = 0;
+  var running = false, lost = false;
+
+  var hud = document.getElementById('hud');
+  var wrap = document.getElementById('wrap');
+  var cv = document.getElementById('cv');
+  var gl = null, prog = 0, U = {}, ang = 1.2, ang2 = 0.4, lenV = 1.6;
+  var frames = 0, t0 = 0, slowFrames = 0, lastLog = '', lastSrc = '';
+
+  var VS = document.getElementById('vsSrc').textContent;
+  var FS_RAW = document.getElementById('fsSrc').textContent;
+
+  function defines(l) {
+    return '#define PI 3.14159265358979324\n' +
+           '#define M_L 0.3819660113\n' +
+           '#define M_R 0.6180339887\n' +
+           '#define MAXR ' + l.maxr + '\n' +
+           '#define SOLVER ' + l.solver + '\n' +
+           '#define STEP ' + l.step + '\n' +
+           '#define STEPS ' + l.steps + '\n';
+  }
+  var precMode = 'high';
+  function prec() {
+    if (precMode === 'med') return 'precision mediump float;\nprecision mediump int;\n';
+    return '#ifdef GL_FRAGMENT_PRECISION_HIGH\n' +
+           'precision highp float;\nprecision highp int;\n' +
+           '#else\nprecision mediump float;\nprecision mediump int;\n#endif\n';
+  }
+  function fsSrc() {
+    return FS_RAW.replace(/__PRECISION__/, prec())
+                 .replace(/__LEVEL_DEFINES__/, defines(LEVELS[li]));
+  }
+
+  // ---------- GL 初始化 ----------
+  function init() {
+    gl = cv.getContext('webgl', {
+      alpha: false, antialias: false, depth: false, stencil: false,
+      preserveDrawingBuffer: false, powerPreference: 'high-performance'
+    });
+    if (!gl) { note = '浏览器不支持 WebGL / 硬件加速未开'; return false; }
+    gpu = gl.getParameter(gl.RENDERER);
+    try {
+      var hp = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT);
+      if (!hp || hp.precision <= 0) precMode = 'med';
+    } catch (e) { precMode = 'med'; }
+
+    prog = buildProg(VS, fsSrc());
+    if (!prog && precMode === 'high') { precMode = 'med'; prog = buildProg(VS, fsSrc()); }
+    if (!prog) { note = '着色器编译失败\n' + lastLog.slice(0, 200); return false; }
+
+    ['right','forward','up','origin','len','x','y'].forEach(function (n) {
+      U[n] = gl.getUniformLocation(prog, n);
+    });
+    var vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1,-1,0,1, 1,-1,0,1, 1,1,0,1,
+      -1,-1,0,1, 1,1,0,1, -1,1,0,1
+    ]), gl.STATIC_DRAW);
+    var loc = gl.getAttribLocation(prog, 'position');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, 0, 0);
+    gl.useProgram(prog);
+    gl.disable(gl.DEPTH_TEST);
+
+    // GPU 上下文丢失：负载过高时驱动会直接回收，必须捕获，否则就是永久白屏
+    cv.addEventListener('webglcontextlost', function (e) {
+      e.preventDefault(); lost = true; stop();
+      note = 'GPU 上下文已丢失（负载过高，驱动回收）。\n已自动停止，请降低档位/尺寸后重试。';
+      paint();
+    });
+    cv.addEventListener('webglcontextrestored', function () { lost = false; });
+
+    setBuf(SIZES[si]);
+    return true;
+  }
+
+  function buildProg(vs, fs) {
+    var v = sh(gl.VERTEX_SHADER, vs), f = sh(gl.FRAGMENT_SHADER, fs);
+    if (!v || !f) return 0;
+    var p = gl.createProgram();
+    gl.attachShader(p, v); gl.attachShader(p, f); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      lastLog = gl.getProgramInfoLog(p) || '(无日志)'; return 0;
+    }
+    return p;
+  }
+  function sh(type, src) {
+    var s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      lastLog = gl.getShaderInfoLog(s) || '(无日志)'; lastSrc = src; return 0;
+    }
+    return s;
+  }
+
+  function setBuf(n) {
+    cv.width = n; cv.height = n;
+    gl.viewport(0, 0, n, n);
+  }
+  function setCam(a1, a2) {
+    var len = lenV;
+    var c1 = Math.cos(a1), s1 = Math.sin(a1), c2 = Math.cos(a2), s2 = Math.sin(a2);
+    gl.uniform3f(U.origin,  len*c1*c2, len*s2, len*s1*c2);
+    gl.uniform3f(U.right,   s1, 0, -c1);
+    gl.uniform3f(U.up,      -s2*c1, c2, -s2*s1);
+    gl.uniform3f(U.forward, -c1*c2, -s2, -s1*c2);
+    gl.uniform1f(U.len, len);
+    gl.uniform1f(U.x, 1.0);
+    gl.uniform1f(U.y, 1.0);          // 正方形缓冲 -> 长宽比补偿恒为 1
+  }
+  function draw() {
+    setCam(ang, ang2);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  // ---------- 安全探测：先用极小缓冲外推，避免一上来就卡死 ----------
+  var PROBE_N = 96;
+  function probe(level, size) {
+    // 用目标档位的着色器，在 96² 缓冲上跑，测出单帧耗时再外推到目标尺寸
+    var lvl = LEVELS[level];
+    var src = FS_RAW.replace(/__PRECISION__/, prec())
+                    .replace(/__LEVEL_DEFINES__/, defines(lvl));
+    var p = buildProg(VS, src);
+    if (!p) return -1;                       // 编译失败：保留原 program，别破坏现场
+    var old = prog; prog = p; gl.useProgram(p);
+    ['right','forward','up','origin','len','x','y'].forEach(function (n) {
+      U[n] = gl.getUniformLocation(p, n);
+    });
+    // 换 program 后 attribute location 可能变，必须重新绑定
+    var loc = gl.getAttribLocation(p, 'position');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, 0, 0);
+    if (old) gl.deleteProgram(old);
+
+    setBuf(PROBE_N);
+    draw(); gl.finish();                     // 预热：首次含驱动编译/上传开销
+    var t1 = perf(function () { draw(); gl.finish(); });
+    var perFrame;
+    if (t1 > 600) {
+      perFrame = t1;                         // 已经很慢，别再测了，直接外推
+    } else {
+      var t4 = perf(function () {
+        for (var i = 0; i < 4; i++) { draw(); gl.finish(); }
+      });
+      perFrame = t4 / 4;
+    }
+    var ratio = (size * size) / (PROBE_N * PROBE_N);
+    return perFrame * ratio * 1.3;           // 1.3 保守系数
+  }
+  function perf(fn) {
+    var a = performance.now(); fn();
+    return performance.now() - a;
+  }
+
+  // ---------- 渲染循环 ----------
+  var lastTick = 0;
+  function loop() {
+    if (!running || lost) return;
+    var now0 = performance.now();
+    // 关键：drawArrays 是异步提交，JS 侧几乎不耗时，测 JS 时间等于没测。
+    // 真正反映 GPU 负载的是 rAF 回调之间的间隔——GPU 忙时合成器会拉长它。
+    if (lastTick) {
+      var gap = now0 - lastTick;
+      if (gap > 3000) {                      // 一帧就 3 秒，立刻刹车，不等第二帧
+        emergency(gap); return;
+      }
+      if (gap > 1500) slowFrames++; else slowFrames = 0;
+      if (slowFrames >= 2) {                 // 连续 2 帧超 1.5 秒
+        emergency(gap); return;
+      }
+    }
+    lastTick = now0;
+
+    draw();
+    frames++;
+    ang += 0.01;
+
+    var now = performance.now(), el = now - t0;
+    if (el >= 500) { fps = frames * 1000 / el; frames = 0; t0 = now; paint(); }
+    requestAnimationFrame(loop);
+  }
+  function emergency(gap) {
+    stop();
+    note = '检测到帧间隔 ' + gap.toFixed(0) + ' ms，已紧急停止以避免系统卡死。\n请降低档位或尺寸。';
+    autoDowngrade();
+    paint();
+  }
+  function start() {
+    if (!gl || lost) return;
+    setBuf(SIZES[si]);
+    running = true; frames = 0; slowFrames = 0; lastTick = 0;
+    t0 = performance.now();
+    document.getElementById('bRun').textContent = '停止';
+    document.getElementById('bRun').className = 'hot';
+    paint();
+    requestAnimationFrame(loop);
+  }
+  function stop() {
+    running = false;
+    document.getElementById('bRun').textContent = '开始';
+    document.getElementById('bRun').className = 'safe';
+    paint();
+  }
+  function autoDowngrade() {
+    if (li > 0) li--;
+    else if (si > 0) si--;
+    note += '\n已自动降级到 ' + LEVELS[li].name + ' / ' + SIZES[si] + '²';
+  }
+
+  // ---------- 切档位/尺寸：先探测，不安全就问 ----------
+  function retarget(newLi, newSi) {
+    stop();
+    note = '';
+    var lvl = LEVELS[newLi], size = SIZES[newSi];
+    hud.innerHTML = '<span class="ok">正在安全探测 ' + lvl.name + ' / ' + size + '² …</span>';
+    // 让 HUD 先绘制出来，再进重负载
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        var e = probe(newLi, newSi);
+        if (e < 0) {
+          note = '该档位着色器编译失败：\n' + lastLog.slice(0, 200);
+          paint(); return;
+        }
+        est = e;
+        li = newLi; si = newSi;
+        if (e > 120) {
+          var f = (1000 / e).toFixed(1);
+          var go = confirm(
+            '预计单帧 ' + e.toFixed(0) + ' ms（约 ' + f + ' FPS）。\n' +
+            '这个负载很可能让手机卡死或触发 GPU 重置。\n\n确定要继续吗？'
+          );
+          if (!go) { note = '已取消。建议：降档位（左下【档位】）或降尺寸。'; paint(); return; }
+        }
+        start();
+        paint();
+      });
+    });
+  }
+
+  // ---------- 交互 ----------
+  var bRun = document.getElementById('bRun');
+  document.getElementById('bLvl').onclick = function () {
+    retarget((li + 1) % LEVELS.length, si);
+  };
+  document.getElementById('bSize').onclick = function () {
+    retarget(li, (si + 1) % SIZES.length);
+  };
+  bRun.onclick = function () { running ? stop() : start(); paint(); };
+  document.getElementById('bReset').onclick = function () {
+    ang = 1.2; ang2 = 0.4; lenV = 1.6; paint();
+  };
+  // 实测：只渲染 1 帧 + gl.finish()，拿到精确 GPU 耗时。只跑一帧，不会卡死。
+  document.getElementById('bProbe').onclick = function () {
+    stop();
+    hud.innerHTML = '<span class="ok">实测中（只跑 1 帧）…</span>';
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        setBuf(SIZES[si]);
+        draw(); gl.finish();
+        measured = perf(function () { draw(); gl.finish(); });
+        paint();
+      });
+    });
+  };
+
+  // 锚点：lx/ly 始终是"当前这组手指的代表点"（单指=指尖，双指=两指中心），
+  // pd 是两指间距。手指数量一变就重新锚定并丢弃这一帧，否则会跳。
+  var lx = 0, ly = 0, pd = 0, pn = 0;
+  var ROT = 0.006;
+
+  function anchor(e) {
+    var n = e.touches.length;
+    if (n === 1) {
+      lx = e.touches[0].clientX;
+      ly = e.touches[0].clientY;
+    } else if (n >= 2) {
+      // 双指用两指中心做锚点：松开一根手指时，剩下的那根离中心最近，跳变最小
+      lx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      ly = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    }
+    pd = (n >= 2) ? Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                               e.touches[0].clientY - e.touches[1].clientY) : 0;
+    pn = n;
+  }
+
+  cv.addEventListener('touchstart', function (e) {
+    anchor(e);                       // 重新锚定，不套用旧基准
+  }, { passive: true });
+
+  cv.addEventListener('touchmove', function (e) {
+    var n = e.touches.length;
+    if (n !== pn) {                  // 手指数量变了（2→1 或 1→2）
+      anchor(e);                     // 只重设基准，本帧不产生任何旋转/缩放
+      e.preventDefault();
+      return;
+    }
+    if (n === 1) {
+      // 方向对齐 cznull 原版（vsbm.html mousemove）：ang1 += dx*k; ang2 += dy*k
+      ang  += (e.touches[0].clientX - lx) * ROT;
+      ang2 += (e.touches[0].clientY - ly) * ROT;
+      if (ang2 >  1.5) ang2 =  1.5;  // 夹紧仰角，避免画面上下颠倒
+      if (ang2 < -1.5) ang2 = -1.5;
+      lx = e.touches[0].clientX;
+      ly = e.touches[0].clientY;
+    } else if (n >= 2) {
+      var d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                         e.touches[0].clientY - e.touches[1].clientY);
+      if (pd > 0 && d > 0) {
+        lenV = Math.min(8, Math.max(0.35, lenV * pd / d));
+      }
+      pd = d;
+      // 同步更新中心锚点，切回单指时基准仍然连续
+      lx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      ly = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    }
+    e.preventDefault();
+  }, { passive: false });
+
+  // 手指离开后清零，下次触摸一定从 anchor 重新开始
+  function release(e) {
+    if (e.touches.length === 0) { pd = 0; pn = 0; }
+    else anchor(e);               // 2→1 的收尾也算数量变化，重新锚定
+  }
+  cv.addEventListener('touchend', release, { passive: true });
+  cv.addEventListener('touchcancel', release, { passive: true });
+
+  function paint() {
+    var l = LEVELS[li], px = (SIZES[si] * SIZES[si] / 1e6).toFixed(2);
+    var h = 'FPS ' + fps.toFixed(1) +
+            (est ? '   预估帧时 ' + est.toFixed(0) + 'ms' : '') +
+            (measured ? '   实测帧时 ' + measured.toFixed(1) + 'ms' : '') + '\n' +
+            '档位 ' + l.name + '  step=' + l.step + '  步数=' + l.steps + '\n' +
+            '缓冲 ' + SIZES[si] + '×' + SIZES[si] + '  ' + px + ' MP\n' +
+            'GPU ' + gpu + '\n' +
+            (running ? '<span class="ok">● 运行中</span>' : '<span class="warn">○ 待运行</span>') +
+            '   精度 ' + precMode + 'p';
+    if (note) h += '\n<span class="warn">' + esc(note) + '</span>';
+    h += '\n<span class="ok">单指旋转 · 双指缩放 · 先降档位再降尺寸</span>';
+    hud.innerHTML = h;
+  }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // ---------- 启动：只初始化 + 画一帧，绝不直接开跑 ----------
+  if (!init()) {
+    hud.innerHTML = '<span class="warn">' + esc(note || '初始化失败') + '</span>';
+  } else {
+    // 先静态画一帧，确认有画面；跑循环要用户点【开始】
+    setBuf(SIZES[si]);
+    draw(); gl.finish();
+    stop();                       // 同步按钮文案为「开始」
+    note = '已就绪。点【开始】才运行；先点【实测】可安全测单帧耗时。';
+    paint();
+  }
+})();
+</script>
+</body>
+</html>
