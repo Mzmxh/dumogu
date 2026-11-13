@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<title>毒蘑菇 · 安全版</title>
+<title>毒蘑菇</title>
 <style>
   html,body{margin:0;height:100%;background:#131115;overflow:hidden;
     font-family:monospace;-webkit-user-select:none;user-select:none;}
@@ -23,19 +23,37 @@
   button:active{background:#555;}
   button.hot{background:#c62828;color:#fff;}
   button.safe{background:#2e7d32;color:#fff;}
+  #dlg{position:fixed;inset:0;background:#00000099;z-index:20;display:none;
+    align-items:center;justify-content:center;}
+  #dlg .box{background:#212121;color:#eee;border-radius:10px;padding:18px 20px;
+    width:78vw;max-width:340px;font-size:13px;line-height:1.6;
+    box-shadow:0 8px 32px #000a;}
+  #dlg .t{font-size:15px;font-weight:bold;margin-bottom:8px;color:#FFD54F;}
+  #dlg .row{display:flex;gap:10px;margin-top:16px;}
+  #dlg .row button{flex:1;padding:12px 4px;font-size:13px;}
 </style>
 </head>
 <body>
 <div id="wrap"><canvas id="cv"></canvas></div>
 <div id="hud">初始化…</div>
 <div id="bar">
-  <button id="bLvl">档位</button>
-  <button id="bSize">尺寸</button>
   <button id="bRun" class="safe">开始</button>
   <button id="bModel">模型</button>
-  <button id="bProbe">实测</button>
+  <button id="bLvl">档位</button>
+  <button id="bRes">分辨率</button>
+  <button id="bOrig">原版</button>
+  <button id="bVsync">vsync</button>
+  <button id="bRotate">自转</button>
   <button id="bReset">复位</button>
 </div>
+<div id="dlg"><div class="box">
+  <div class="t">负载过高</div>
+  <div id="dlgMsg"></div>
+  <div class="row">
+    <button id="dlgIgnore">忽略继续</button>
+    <button id="dlgStop" class="hot">停止</button>
+  </div>
+</div></div>
 
 <!-- ============ 顶点着色器（GLSL ES 1.00，兼容性最好） ============ -->
 <script id="vsSrc" type="x-shader/x-vertex">
@@ -53,7 +71,7 @@ void main() {
 }
 </script>
 
-<!-- ============ 片元着色器：cznull 原版数学，逐字移植 ============ -->
+<!-- ============ 片元着色器：cznull 原版数学 + 严格等价优化 ============ -->
 <script id="fsSrc" type="x-shader/x-fragment">
 __PRECISION__
 __LEVEL_DEFINES__
@@ -72,16 +90,57 @@ vec3 color;
 void main() {
    color.r=0.0; color.g=0.0; color.b=0.0;
    hit=0;
+#if CULL_BOUND
+   // ==== 包围球快速排除（与安卓/Windows 版同源）====
+   // dir 未归一化，故在参数空间求交：|origin + dir*t|^2 = R^2
+   float bda = dot(dir, dir);
+   float bdb = dot(origin, dir);
+   float bdc = dot(origin, origin) - BOUND_R * BOUND_R;
+   float bdisc = bdb * bdb - bda * bdc;
+   if (bdisc < 0.0) {
+      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+      return;
+   }
+#endif
+#if OPT_INTERVAL
+   // ==== 包围区间裁剪（严格等价）====
+   // 模型整体在球内 => 球外 kernal<=0，不可能命中；循环状态只依赖前两步
+   // v1/v2，按 kStart 重新初始化后与原循环完全对齐。t = step*len*k。
+   float bsq = sqrt(bdisc);
+   float tEnter = (-bdb - bsq) / bda;
+   float tExit  = (-bdb + bsq) / bda;
+   float rayDt = step_ * len;
+   int kStart = int(ceil(max(tEnter, 0.0) / rayDt)) - 2;
+   if (kStart < 2) kStart = 2;
+   float kEndF = floor(tExit / rayDt) + 3.0;      // 出口留 3 步余量
+   if (kEndF > float(STEPS)) kEndF = float(STEPS);
+   int kEnd = int(kEndF);
+   if (kEnd < kStart) kEnd = kStart;
+   v1 = kernal(origin + dir * (rayDt * float(kStart - 1)));
+   v2 = kernal(origin + dir * (rayDt * float(kStart - 2)));
+#else
+   // 未启用区间裁剪（mediump 回退）：与移植前的原始循环逐字一致
    v1 = kernal(origin + dir * (step_*len));
    v2 = kernal(origin);
+#endif
+   // GLSL ES 1.00 附录 A 要求 for 循环起始/上界是常量表达式，所以起始仍写 2、
+   // 上界仍写 STEPS。用一层常量边界的 if 包住循环体来跳过区间外的空步——
+   // 不用 continue：部分移动端 ESSL 1.00 驱动会尝试完全展开 for 循环，
+   // 遇到 continue 时编译期会暴涨甚至卡死。
    for (int k = 2; k < STEPS; k++) {
+#if OPT_INTERVAL
+      if (k >= kStart && k < kEnd) {
+#endif
       ver = origin + dir * (step_*len*float(k));
       v = kernal(ver);
       if (v > 0.0 && v1 < 0.0) {
          r1 = step_ * len*float(k - 1);
          r2 = step_ * len*float(k);
+#if !OPT_DEAD
+         // 这两个值随后只被覆盖写、从未被读取（kernal 是纯函数）
          m1 = kernal(origin + dir * r1);
          m2 = kernal(origin + dir * r2);
+#endif
          for (int l = 0; l < SOLVER; l++) {
             r3 = r1 * 0.5 + r2 * 0.5;
             m3 = kernal(origin + dir * r3);
@@ -112,8 +171,10 @@ void main() {
          }
          if (m2 > 0.0) {
             r1 = step_ * len*float(k - 2);
+#if !OPT_DEAD
             m1 = kernal(origin + dir * r1);
             m2 = kernal(origin + dir * r2);
+#endif
             for (int l = 0; l < SOLVER; l++) {
                r3 = r1 * 0.5 + r2 * 0.5;
                m3 = kernal(origin + dir * r3);
@@ -124,8 +185,10 @@ void main() {
          } else if (m3 > 0.0) {
             r1 = step_ * len*float(k - 2);
             r2 = r3;
+#if !OPT_DEAD
             m1 = kernal(origin + dir * r1);
             m2 = kernal(origin + dir * r2);
+#endif
             for (int l = 0; l < SOLVER; l++) {
                r3 = r1 * 0.5 + r2 * 0.5;
                m3 = kernal(origin + dir * r3);
@@ -137,6 +200,9 @@ void main() {
       }
       v2 = v1;
       v1 = v;
+#if OPT_INTERVAL
+      }
+#endif
    }
    if (hit==1) {
       ver = origin + dir*r3;
@@ -163,6 +229,15 @@ void main() {
       n.x = sin(r1*10.0)*0.5+0.5;
       n.y = sin(r1*10.0+2.05)*0.5+0.5;
       n.z = sin(r1*10.0-2.05)*0.5+0.5;
+#elif COLOR_MODE == 2
+// 漩涡玫瑰专用：按对数螺旋相位做彩虹环带。
+// 参考图是「一圈圈彩虹带绕中心旋转收缩」；
+// 若按 x/y/z 坐标着色会得到棋盘格而不是同心环，所以这里改用相位。
+float cr = length(surfP.xz);
+float cph = 5.0*atan(surfP.z, surfP.x + 1e-5) + 6.0*log(max(cr, 0.05));
+n.x = sin(cph)*0.5+0.5;
+n.y = sin(cph+2.05)*0.5+0.5;
+n.z = sin(cph-2.05)*0.5+0.5;
 #else
       // 非标准模型：按表面点坐标做彩虹。
       // 不用法线配色是因为立方体/圆柱这类平面几何体法线恒定，会整块纯色；
@@ -186,7 +261,11 @@ void main() {
     { name: 'SIMPLE',   step: '0.01',  steps: 202,  maxr: 4, solver: 4 },
     { name: 'STANDARD', step: '0.004', steps: 502,  maxr: 6, solver: 6 },
     { name: 'ADVANCED', step: '0.002', steps: 1002, maxr: 8, solver: 8 },
-    { name: 'EXTREME',  step: '0.001', steps: 2002, maxr: 8, solver: 8 }
+    { name: 'EXTREME',  step: '0.001', steps: 2002, maxr: 8, solver: 8 },
+    // 可选粗采样档（与安卓/Windows 版一致）：步长翻倍、步数减半，
+    // 覆盖同样的空间范围但采样密度减半，约 1.5x 速度。
+    // 会改变外观（薄结构/边缘细节），默认不启用。
+    { name: 'TURBO',    step: '0.02',  steps: 102,  maxr: 4, solver: 4 }
   ];
   // 正方形缓冲边长（原版网页就是 1024×1024 正方形）
   var SIZES = [256, 384, 512, 768, 1024];
@@ -341,37 +420,56 @@ void main() {
 '   return -max(box, -holes);\n' +
 '}\n' },
   // ---- 玫瑰：上下两面互为镜像 ----
-  { name: '玫瑰线', std: false, glsl:
+  { name: '漩涡玫瑰', std: false, cm: 2, glsl:
 'float kernal(vec3 p){\n' +
 '   float r = length(p.xz);\n' +
-'   float th = atan(p.z, p.x);\n' +
-'   // |cos(2.5*th)| 在 th=0..2PI 上首尾连续，给出 5 片花瓣\n' +
-'   float rose = 0.66 * abs(cos(2.5 * th));\n' +
-'   float u = r / max(rose, 1e-2);\n' +
-'   // 厚度不乘轮廓系数：否则边缘厚度被压到 0，斜俯视下看成一条扁带\n' +
-'   float halfh = 0.20 + 0.10 * u * u;\n' +
+'   float th = atan(p.z, p.x + 1e-5);\n' +
+'   // 五瓣外轮廓\n' +
+'   float outline = 0.60 + 0.40*abs(cos(2.5*th));\n' +
+'   float u = r / max(outline, 1e-2);\n' +
+'   // 对数螺旋相位：环带随半径持续滞后 -> 向中心旋转收缩，\n' +
+'   // 且越靠中心环距越密（正是参考图「中心密集、外缘宽大」的来源）\n' +
+'   float phase = 5.0*th + 6.0*log(max(r, 0.05));\n' +
+'   // 起伏从中心向外渐强\n' +
+'   float amp = 0.070 * smoothstep(0.08, 0.70, r);\n' +
+'   float halfh = 0.120 + amp*cos(phase);\n' +
 '   float d = abs(p.y) - halfh;\n' +
-'   // 用 max 取交集：既要落在花瓣轮廓内(u<1)，又要在厚度范围内\n' +
-'   float radial = (u - 1.0) * rose;\n' +
+'   float radial = (u - 1.0) * outline;\n' +
 '   // abs(p.y) 保证上下两面严格镜像\n' +
 '   return -max(d, radial);\n' +
 '}\n' },
-  { name: '球形玫瑰', std: false, glsl:
-'float kernal(vec3 p){\n' +
-'   float r = length(p);\n' +
-'   if(r < 1e-4){ return 0.60; }\n' +
-'   float th = acos(p.z / r);\n' +
-'   float ph = atan(p.y, p.x);\n' +
-'   // cos(2n*th) 在 th 与 PI-th 处取值相同 -> 南北严格镜像\n' +
-'   float w = 0.13 * cos(2.0 * th) + 0.07 * cos(4.0 * th);\n' +
-'   float rose = 0.60 + 0.14 * cos(5.0 * ph) + w;\n' +
-'   return -(r - rose);\n' +
-'}\n' }
+  { name: '玫瑰球', std: false, cm: 2, glsl:
+'float kernal(vec3 ver){\n' +
+'   // 1.3 = 缩小系数。原尺寸在默认视距下占屏 48%，太大；\n' +
+'   // 缩到 0.77 倍后覆盖率 20.8%，与漩涡玫瑰(21.9%)相当。\n' +
+'   vec3 p = ver * 1.3;\n' +
+'   float a = p.z * 3.14159 * 2.0;\n' +
+'   float c = cos(a);\n' +
+'   float s = sin(a);\n' +
+'   float px = p.x * c - p.y * s;\n' +
+'   float py = p.x * s + p.y * c;\n' +
+'   float pz = p.z;\n' +
+'   float x = cos(1.0 / (px*px + 0.06));\n' +
+'   float y = cos(1.0 / (py*py + 0.06));\n' +
+'   float z = cos(1.0 / (pz*pz + 0.06));\n' +
+'   return -x - y - z - 1.2;\n' +
+'}\n'
+ }
+
   ];
+
+  // 包围球半径：与安卓 / Windows 版同源（GPU 探针实测 + 安全余量）。
+  // 顺序与 MODELS 严格一致，用于射线求交的区间裁剪。
+  var BOUND_R = [1.19, 1.02, 1.18, 0.99, 0.99, 0.91, 0.83, 1.05, 1.07,
+                 1.35, 1.51, 1.07, 1.02, 0.94, 1.29, 1.13, 1.23];
+  MODELS.forEach(function (m, i) { m.R = BOUND_R[i]; });
 
   var li = 0, si = 2, mi = 0;      // 默认 分形 + SIMPLE + 512²，安全起步
   var fps = 0, gpu = '-', note = '', est = 0, measured = 0;
   var running = false, lost = false;
+  // 与 exe / APK 对齐的四个状态：默认自转开、原版关、vsync 锁定
+  var autoRotate = true, origMode = false, vsyncUnlocked = false;
+  var watchdogOff = false, diagShown = false;
 
   var hud = document.getElementById('hud');
   var wrap = document.getElementById('wrap');
@@ -383,6 +481,14 @@ void main() {
   var FS_RAW = document.getElementById('fsSrc').textContent;
 
   function defines(l, m) {
+    // 两项严格等价优化（与安卓 / Windows 版同步，逐像素验证过）：
+    //   OPT_INTERVAL 包围区间裁剪 —— 平均步进次数 -62.2%，画面不变
+    //   OPT_DEAD     删除 6 处结果从未被读取的 kernal 调用
+    // OPT_POW 把 pow(b,8.0) 换连乘，实测会改像素（混沌迭代放大 1 ulp
+    // 舍入差），固定为 0，不启用。
+    // mediump 回退时关掉区间裁剪：sqrt/ceil/floor 在 mediump 下精度不足，
+    // 宁可退回原始循环，也不能让画面出现偏差。
+    var optInterval = (precMode === 'high') ? 1 : 0;
     return '#define PI 3.14159265358979324\n' +
            '#define M_L 0.3819660113\n' +
            '#define M_R 0.6180339887\n' +
@@ -391,8 +497,16 @@ void main() {
            '#define STEP ' + l.step + '\n' +
            '#define STEPS ' + l.steps + '\n' +
            // 0 = 原版按距离配色（仅分形）；1 = 按法线配色（简单几何体）
-           '#define COLOR_MODE ' + (m && m.std ? '0' : '1') + '\n';
+           '#define COLOR_MODE ' + (m && m.cm !== undefined ? m.cm : (m && m.std ? 0 : 1)) + '\n' +
+           '#define BOUND_R ' + (m && m.R ? m.R : 1.19) + '\n' +
+           '#define CULL_BOUND 1\n' +
+           '#define OPT_INTERVAL ' + optInterval + '\n' +
+           '#define OPT_DEAD 1\n' +
+           '#define OPT_POW ' + OPT_POW + '\n';
   }
+  // pow 连乘优化：数学等价但浮点不等价（安卓实测 162 像素、Windows 实测 83 像素差异，
+  // 分形的 5 次混沌迭代会放大 1 ulp 舍入差），固定关闭，与三端交付配置一致。
+  var OPT_POW = 0;
   var precMode = 'high';
   function prec() {
     if (precMode === 'med') return 'precision mediump float;\nprecision mediump int;\n';
@@ -402,11 +516,30 @@ void main() {
   }
   function buildFS(modelIdx, levelIdx) {
     var m = MODELS[modelIdx];
+    var kernel = m.glsl;
+    if (OPT_POW) {
+      kernel = kernel.replace(/b=pow\(b,8\.0\);/g, 'b=b*b; b=b*b; b=b*b;')
+                     .replace(/b=pow\(b,4\.0\);/g, 'b=b*b; b=b*b;');
+    }
     return FS_RAW.replace(/__PRECISION__/, prec())
-                 .replace(/__KERNEL__/, m.glsl)
+                 .replace(/__KERNEL__/, kernel)
                  .replace(/__LEVEL_DEFINES__/, defines(LEVELS[levelIdx], m));
   }
   function fsSrc() { return buildFS(mi, li); }
+
+  /** 所有按钮文案一律从真实状态推导，不依赖本地副本 */
+  function syncButtons() {
+    var b;
+    b = document.getElementById('bRun');
+    b.textContent = running ? '停止' : '开始';
+    b.className = running ? 'hot' : 'safe';
+    document.getElementById('bModel').textContent = '模型';
+    document.getElementById('bLvl').textContent = '档位 ' + LEVELS[li].name;
+    document.getElementById('bRes').textContent = '分辨率 ' + SIZES[si];
+    document.getElementById('bOrig').textContent = origMode ? '原版 开' : '原版 关';
+    document.getElementById('bVsync').textContent = vsyncUnlocked ? 'vsync 解锁' : 'vsync 锁定';
+    document.getElementById('bRotate').textContent = autoRotate ? '自转 ON' : '自转 OFF';
+  }
 
   // ---------- GL 初始化 ----------
   function init() {
@@ -532,52 +665,71 @@ void main() {
   }
 
   // ---------- 渲染循环 ----------
-  var lastTick = 0;
+  var lastTick = 0, loopPending = false;
+  function scheduleNext() {
+    if (!running || lost || loopPending) return;   // 防重复调度造成双渲染链
+    loopPending = true;
+    if (vsyncUnlocked) {
+      // 绕开 rAF 的刷新率锁：宏任务 + gl.finish() 反映 GPU 真实上限。
+      // 注意浏览器无法真正解锁显示 vsync，这里突破的是「渲染帧率」。
+      setTimeout(function () {
+        loopPending = false;
+        if (running && !lost) loop();
+      }, 0);
+    } else {
+      requestAnimationFrame(function () {
+        loopPending = false;
+        if (running && !lost) loop();
+      });
+    }
+  }
   function loop() {
     if (!running || lost) return;
     var now0 = performance.now();
     // 关键：drawArrays 是异步提交，JS 侧几乎不耗时，测 JS 时间等于没测。
     // 真正反映 GPU 负载的是 rAF 回调之间的间隔——GPU 忙时合成器会拉长它。
-    if (lastTick) {
+    // 弹窗显示中 / 已选「忽略继续」时跳过看门狗，但渲染照常推进
+    if (lastTick && !watchdogOff && !diagShown) {
       var gap = now0 - lastTick;
-      if (gap > 3000) {                      // 一帧就 3 秒，立刻刹车，不等第二帧
-        emergency(gap); return;
+      if (gap > 3000) {                      // 一帧就 3 秒，弹窗询问
+        emergency(gap); scheduleNext(); return;
       }
       if (gap > 1500) slowFrames++; else slowFrames = 0;
       if (slowFrames >= 2) {                 // 连续 2 帧超 1.5 秒
-        emergency(gap); return;
+        emergency(gap); scheduleNext(); return;
       }
     }
     lastTick = now0;
 
     draw();
+    if (vsyncUnlocked) gl.finish();     // 全力模式下同步 GPU，避免提交队列堆积
     frames++;
-    ang += 0.01;
+    if (autoRotate) ang += 0.01;
 
     var now = performance.now(), el = now - t0;
     if (el >= 500) { fps = frames * 1000 / el; frames = 0; t0 = now; paint(); }
-    requestAnimationFrame(loop);
+    scheduleNext();
   }
+  // 低帧率不再自动刹车，改成弹窗选「忽略继续 / 停止」（与 exe / APK 一致）
   function emergency(gap) {
-    stop();
-    note = '帧间隔 ' + gap.toFixed(0) + 'ms，已紧急停止';
-    autoDowngrade();
-    paint();
+    if (watchdogOff || diagShown) return;
+    diagShown = true;
+    document.getElementById('dlgMsg').textContent =
+      '帧间隔 ' + gap.toFixed(0) + 'ms，负载过高';
+    document.getElementById('dlg').style.display = 'flex';
+    // 不在这里调度：由 loop 的 emergency 分支统一 scheduleNext，避免双链
   }
   function start() {
     if (!gl || lost) return;
     setBuf(SIZES[si]);
     running = true; frames = 0; slowFrames = 0; lastTick = 0;
+    watchdogOff = false; diagShown = false;
     t0 = performance.now();
-    document.getElementById('bRun').textContent = '停止';
-    document.getElementById('bRun').className = 'hot';
-    paint();
-    requestAnimationFrame(loop);
+    paint(); scheduleNext();
   }
   function stop() {
     running = false;
-    document.getElementById('bRun').textContent = '开始';
-    document.getElementById('bRun').className = 'safe';
+    document.getElementById('dlg').style.display = 'none';
     paint();
   }
   function autoDowngrade() {
@@ -627,33 +779,53 @@ void main() {
     });
   }
 
-  // ---------- 交互 ----------
-  var bRun = document.getElementById('bRun');
+  // ---------- 交互（8 按钮，与 exe / APK 一致）----------
+  document.getElementById('bRun').onclick = function () {
+    running ? stop() : start();
+  };
   document.getElementById('bModel').onclick = function () {
     retarget((mi + 1) % MODELS.length, li, si);
   };
   document.getElementById('bLvl').onclick = function () {
+    origMode = false;                 // 手动调档位即退出原版口径
     retarget(mi, (li + 1) % LEVELS.length, si);
   };
-  document.getElementById('bSize').onclick = function () {
+  document.getElementById('bRes').onclick = function () {
+    origMode = false;
     retarget(mi, li, (si + 1) % SIZES.length);
   };
-  bRun.onclick = function () { running ? stop() : start(); paint(); };
+  document.getElementById('bOrig').onclick = function () {
+    origMode = !origMode;
+    // 原版口径：1024² + ADVANCED(1002 步) + 正方形等比显示（网页本来就是
+    // 正方形缓冲 + object-fit:contain，不存在拉伸）
+    if (origMode) retarget(mi, 2, SIZES.length - 1);
+    else retarget(mi, 0, 2);
+  };
+  document.getElementById('bVsync').onclick = function () {
+    vsyncUnlocked = !vsyncUnlocked;
+    note = vsyncUnlocked ? '已绕开 rAF 节流（显示刷新率仍由浏览器决定）' : '';
+    if (running) { lastTick = 0; slowFrames = 0; scheduleNext(); }
+    paint();
+  };
+  document.getElementById('bRotate').onclick = function () {
+    autoRotate = !autoRotate;
+    paint();
+  };
   document.getElementById('bReset').onclick = function () {
     ang = 1.2; ang2 = 0.4; lenV = 1.6; paint();
   };
-  // 实测：只渲染 1 帧 + gl.finish()，拿到精确 GPU 耗时。只跑一帧，不会卡死。
-  document.getElementById('bProbe').onclick = function () {
+  // 看门狗弹窗
+  document.getElementById('dlgIgnore').onclick = function () {
+    watchdogOff = true;               // 本次运行不再触发
+    diagShown = false;
+    lastTick = 0; slowFrames = 0;
+    document.getElementById('dlg').style.display = 'none';
+    // 渲染链仍在跑，不需要再调度
+  };
+  document.getElementById('dlgStop').onclick = function () {
     stop();
-    hud.innerHTML = '<span class="ok">实测中…</span>';
-    requestAnimationFrame(function () {
-      requestAnimationFrame(function () {
-        setBuf(SIZES[si]);
-        draw(); gl.finish();
-        measured = perf(function () { draw(); gl.finish(); });
-        paint();
-      });
-    });
+    autoDowngrade();
+    paint();
   };
 
   // 锚点：lx/ly 始终是"当前这组手指的代表点"（单指=指尖，双指=两指中心），
@@ -676,11 +848,18 @@ void main() {
     pn = n;
   }
 
-  cv.addEventListener('touchstart', function (e) {
+  // 挂在 document 而不是 canvas：某些预览容器会盖住 canvas 导致收不到 touch
+  function onButton(e) {             // 底部按钮区不参与旋转
+    var t = e.target;
+    return t && t.tagName === 'BUTTON';
+  }
+  document.addEventListener('touchstart', function (e) {
+    if (onButton(e)) return;
     anchor(e);                       // 重新锚定，不套用旧基准
   }, { passive: true });
 
-  cv.addEventListener('touchmove', function (e) {
+  document.addEventListener('touchmove', function (e) {
+    if (onButton(e)) return;
     var n = e.touches.length;
     if (n !== pn) {                  // 手指数量变了（2→1 或 1→2）
       anchor(e);                     // 只重设基准，本帧不产生任何旋转/缩放
@@ -714,22 +893,38 @@ void main() {
     if (e.touches.length === 0) { pd = 0; pn = 0; }
     else anchor(e);               // 2→1 的收尾也算数量变化，重新锚定
   }
-  cv.addEventListener('touchend', release, { passive: true });
-  cv.addEventListener('touchcancel', release, { passive: true });
+  document.addEventListener('touchend', release, { passive: true });
+  document.addEventListener('touchcancel', release, { passive: true });
 
   function paint() {
     var l = LEVELS[li];
-    // 第一行：帧率 + 耗时（预估/实测）
+    // 三行，与 exe / APK 的 HUD 对齐
     var h = 'FPS ' + fps.toFixed(1) +
-            (est ? '  ' + est.toFixed(0) + 'ms' : '') +
-            (measured ? '  ' + measured.toFixed(1) + 'ms' : '') + '\n' +
-            // 第二行：档位 / 模型 / 尺寸
+            (est ? '  ' + est.toFixed(0) + 'ms' : '') + '\n' +
             l.name + ' · ' + MODELS[mi].name +
             (MODELS[mi].std ? '' : '<span class="warn">*</span>') +
-            ' · ' + SIZES[si] + '²';
+            ' · ' + SIZES[si] + '²' + (origMode ? ' 原版' : '') + '\n' +
+            'WebGL · ' + gpu;
     if (note) h += '\n<span class="warn">' + esc(note) + '</span>';
     hud.innerHTML = h;
+    syncButtons();
   }
+  // 鼠标 / 触控板（电脑上调试、或预览容器只派发鼠标事件时用）
+  var dragging = false, mx = 0, my = 0;
+  document.addEventListener('mousedown', function (e) {
+    if (e.target && e.target.tagName === 'BUTTON') return;
+    dragging = true; mx = e.clientX; my = e.clientY;
+  });
+  document.addEventListener('mousemove', function (e) {
+    if (!dragging) return;
+    ang  += (e.clientX - mx) * ROT;
+    ang2 += (e.clientY - my) * ROT;
+    if (ang2 >  1.5) ang2 =  1.5;
+    if (ang2 < -1.5) ang2 = -1.5;
+    mx = e.clientX; my = e.clientY;
+  });
+  document.addEventListener('mouseup', function () { dragging = false; });
+
   function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
